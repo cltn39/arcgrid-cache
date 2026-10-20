@@ -1,3 +1,4 @@
+
 name: Package
 
 on:
@@ -13,16 +14,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
-      - uses: android-actions/setup-android@v3
+
       - uses: gradle/actions/setup-gradle@v4
+
+      - name: Install Android SDK packages
+        run: |
+          sdkmanager --install "platforms;android-34" "build-tools;34.0.0"
+
       - name: Build APK
         run: |
           chmod +x gradlew
-          ./gradlew :app:assembleRelease
+          ./gradlew --no-daemon :app:assembleRelease
+
       - uses: actions/upload-artifact@v4
         with:
           name: px-cache-package
