@@ -10,19 +10,16 @@ import org.jsoup.nodes.Document
 import org.json.JSONObject
 import rx.Observable
 
-/** Experimental single-title source: Bookkor HTML -> bitmap-font -> PNG without Android graphics. */
+/** Bookkor Korean novel extension: HTML chapter pages rendered to PNG. */
 class ArcBridge : HttpSource() {
-    override val name = "Page Cache"
+    override val name = "Bookkor"
     override val lang = "ko"
     override val baseUrl = "https://005.bookkor.com"
     override val supportsLatest = false
 
-    private val bookPath = "/여헌터를-따먹으면-주인공이-강해짐"
-    private val bookTitle = "여헌터를 따먹으면 주인공이 강해짐"
-    private val firstPath = "$bookPath/6426-ep-4165710"
     private val pageHost = "pg-cache.invalid"
     @Volatile private var usePlainHtmlForEpisodes = false
-    @Volatile private var cachedCoverUrl: String? = null
+    private val coverCache = linkedMapOf<String, String>()
 
     // Access this same client from the PNG image loader, just as the successful demo did.
     override val client: OkHttpClient = network.client.newBuilder()
@@ -43,43 +40,145 @@ class ArcBridge : HttpSource() {
             }
         }.build()
 
-    private fun oneBook(): SManga = SManga.create().apply {
-        url = bookPath
-        title = bookTitle
-        description = "실험: 사이트에서 회차를 읽고 글자를 직접 PNG로 변환합니다. 예제 작품 한 개만 포함합니다."
-        genre = "텍스트, 실험"
-        // Existing library entries may need a metadata refresh to receive a cover URL.
-        initialized = false
+    private fun novelPath(value: String): String {
+        // Accept saved Korean and percent-encoded paths, but never an external URL.
+        val path = value.substringBefore('#').substringBefore('?')
+        require(Regex("""^/[^/?#\\]+$""").matches(path)) { "Unexpected novel path: $value" }
+        require(path != "/" && path != "/검색" && path != "/성인소설" &&
+            path != "/일반소설" && path != "/완결소설") { "Not a novel: $path" }
+        return path
     }
 
-    // Include cover metadata in the catalogue entry, not only the details callback.
-    private fun listBook(): SManga = oneBook().apply {
-        thumbnail_url = cachedCoverUrl ?: runCatching { coverFrom(loadHtml(bookPath)) }.getOrNull()
-            ?.also { cachedCoverUrl = it }
+    private fun titleFromPath(path: String): String {
+        val raw = path.substringAfterLast('/')
+        return java.net.URLDecoder.decode(raw.replace("+", "%2B"), "UTF-8").replace('-', ' ')
+    }
+
+    private fun categoryPage(page: Int, query: String): Pair<JSONObject, Document?> {
+        require(page in 1..200) { "Invalid catalogue page: $page" }
+        val keyword = query.trim()
+        // This is the confirmed site search endpoint: /?keyword=<UTF-8 query>.
+        val queryString = if (keyword.isBlank()) "?page=$page" else {
+            val encoded = java.net.URLEncoder.encode(keyword, "UTF-8").replace("+", "%20")
+            "?keyword=$encoded&page=$page"
+        }
+        val request = Request.Builder()
+            .url("$baseUrl/$queryString")
+            .header("User-Agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Version/17.0 Mobile/15E148 Safari/604.1")
+            .header("Accept-Language", "ko-KR,ko;q=0.9,en;q=0.7")
+            // Ordinary HTML GET avoids the 409 experienced with stale Inertia headers.
+            .header("Accept", "text/html, application/xhtml+xml")
+            .build()
+        client.newCall(request).execute().use { response ->
+            check(response.isSuccessful) { "Search page $page returned HTTP ${response.code}" }
+            val body = response.body?.string() ?: error("Empty catalogue response")
+            if (body.trimStart().startsWith("{")) return JSONObject(body) to null
+            val doc = Jsoup.parse(body, response.request.url.toString())
+            val root = doc.selectFirst("[data-page]")
+                ?: error("Bookkor catalogue does not contain an Inertia data-page payload")
+            val embedded = root.attr("data-page").takeIf { it.trimStart().startsWith("{") }
+                ?: root.data().takeIf { it.trimStart().startsWith("{") }
+                ?: error("Bookkor catalogue JSON is not available")
+            return JSONObject(embedded) to doc
+        }
+    }
+
+    private fun cataloguePage(page: Int, query: String): MangasPage {
+        val (payload, htmlDoc) = categoryPage(page, query)
+        // Captured search response uses component=contents/Home and props.comics.data.
+        val props = payload.optJSONObject("props")
+            ?: error("Bookkor catalogue response has no props")
+        val comics = props.optJSONObject("comics")
+            ?: error("Bookkor catalogue response has no props.comics")
+        val items = comics.optJSONArray("data")
+            ?: error("Bookkor catalogue response has no props.comics.data")
+        val kind = props.optJSONObject("content")?.optString("kind")
+        check(kind.isNullOrBlank() || kind == "novel") { "The selected catalogue is not a novel source" }
+
+        // Map covers from HTML cards when the JSON thumbnail is only a bare filename.
+        val listedCovers = HashMap<String, String>()
+        htmlDoc?.select("a[href] img")?.forEach { img ->
+            val anchor = img.closest("a[href]") ?: return@forEach
+            val href = anchor.absUrl("href")
+            if (!href.startsWith("$baseUrl/")) return@forEach
+            val path = href.removePrefix(baseUrl).substringBefore('?').substringBefore('#')
+            if (runCatching { novelPath(path) }.isFailure) return@forEach
+            val candidate = listOf("data-original", "data-src", "data-lazy-src", "src")
+                .map { img.absUrl(it) }.firstOrNull { it.startsWith("https://") || it.startsWith("http://") }
+            if (candidate != null) listedCovers[path] = candidate
+        }
+
+        val mangas = LinkedHashMap<String, SManga>()
+        for (i in 0 until items.length()) {
+            val item = items.optJSONObject(i) ?: continue
+            val slug = item.optString("slug").trim()
+            val path = runCatching { novelPath("/$slug") }.getOrNull() ?: continue
+            val title = item.optString("title").trim().ifBlank { titleFromPath(path) }
+            val thumbnail = item.optString("thumbnail").trim()
+            val directThumb = when {
+                thumbnail.startsWith("https://") || thumbnail.startsWith("http://") -> thumbnail
+                thumbnail.startsWith("/") -> "$baseUrl$thumbnail"
+                else -> null // A bare storage filename is not a usable URL.
+            }
+            val knownCover = synchronized(coverCache) { coverCache[path] }
+            val cover = knownCover ?: listedCovers[path] ?: directThumb
+            mangas[path] = SManga.create().apply {
+                url = path
+                this.title = title
+                thumbnail_url = cover
+                genre = item.optString("tags_string").takeIf { it.isNotBlank() }
+                initialized = false // Let the details request resolve cover and description.
+            }
+            if (cover != null) synchronized(coverCache) { coverCache[path] = cover }
+        }
+
+        // For small search results (e.g. one title), resolve bare-filename covers
+        // from the actual detail page without flooding the site on large results.
+        if (query.isNotBlank() && mangas.size <= 3) {
+            mangas.values.forEach { manga ->
+                if (manga.thumbnail_url.isNullOrBlank()) {
+                    val cover = runCatching { coverFrom(loadHtml(manga.url)) }.getOrNull()
+                    if (cover != null) {
+                        manga.thumbnail_url = cover
+                        synchronized(coverCache) { coverCache[manga.url] = cover }
+                    }
+                }
+            }
+        }
+        val current = comics.optInt("current_page", page)
+        val last = comics.optInt("last_page", page)
+        val hasNext = comics.optString("next_page_url").let {
+            it.isNotBlank() && it != "null"
+        } || current < last
+        return MangasPage(mangas.values.toList(), hasNext)
     }
 
     override fun fetchPopularManga(page: Int): Observable<MangasPage> = Observable.fromCallable {
-        MangasPage(if (page == 1) listOf(listBook()) else emptyList(), false)
+        cataloguePage(page, "")
     }
 
     override fun fetchSearchManga(page: Int, query: String, filters: FilterList): Observable<MangasPage> =
-        Observable.fromCallable {
-            MangasPage(
-                if (page == 1 && bookTitle.contains(query.trim(), ignoreCase = true)) listOf(listBook()) else emptyList(),
-                false,
-            )
-        }
+        Observable.fromCallable { cataloguePage(page, query) }
 
     override fun fetchLatestUpdates(page: Int): Observable<MangasPage> = fetchPopularManga(page)
+
     override fun fetchMangaDetails(manga: SManga): Observable<SManga> = Observable.fromCallable {
-        getMangaDetailsBlocking()
+        getMangaDetailsBlocking(manga)
     }
-    override suspend fun getMangaDetails(manga: SManga): SManga = getMangaDetailsBlocking()
-    private fun getMangaDetailsBlocking(): SManga {
-        val doc = loadHtml(bookPath)
-        return oneBook().apply {
-            description = doc.select("meta[name=description]").attr("content").ifBlank { doc.select("h1").firstOrNull()?.text() ?: bookTitle }
-            thumbnail_url = coverFrom(doc).also { if (it != null) cachedCoverUrl = it }
+    override suspend fun getMangaDetails(manga: SManga): SManga = getMangaDetailsBlocking(manga)
+
+    private fun getMangaDetailsBlocking(manga: SManga): SManga {
+        val path = novelPath(manga.url)
+        val doc = loadHtml(path)
+        return manga.apply {
+            title = doc.selectFirst("h1")?.text()?.takeIf { it.isNotBlank() } ?: title
+            description = doc.select("meta[name=description]").attr("content")
+                .ifBlank { doc.selectFirst(".description,.synopsis,.summary")?.text().orEmpty() }
+            val cover = coverFrom(doc)
+            if (!cover.isNullOrBlank()) {
+                thumbnail_url = cover
+                synchronized(coverCache) { coverCache[path] = cover }
+            } else synchronized(coverCache) { thumbnail_url = coverCache[path] ?: thumbnail_url }
             initialized = true
         }
     }
@@ -130,26 +229,27 @@ class ArcBridge : HttpSource() {
     }
 
     override fun fetchChapterList(manga: SManga): Observable<List<SChapter>> =
-        Observable.fromCallable { getChaptersBlocking() }
+        Observable.fromCallable { getChaptersBlocking(manga) }
 
-    override suspend fun getChapterList(manga: SManga): List<SChapter> = getChaptersBlocking()
+    override suspend fun getChapterList(manga: SManga): List<SChapter> = getChaptersBlocking(manga)
 
     private data class EpisodeInfo(val path: String, val name: String, val number: Float)
     private data class EpisodeBatch(val records: List<EpisodeInfo>, val page: Int, val lastPage: Int?)
 
-    private fun parseEpisodeBatch(inertia: JSONObject): EpisodeBatch {
+    private fun parseEpisodeBatch(inertia: JSONObject, bookPath: String): EpisodeBatch {
         val listing = inertia.optJSONObject("props")?.optJSONObject("episodes")
             ?: error("Inertia response does not contain props.episodes")
         val data = listing.optJSONArray("data") ?: error("Episode page has no data array")
         val records = ArrayList<EpisodeInfo>(data.length())
-        val episodeSlug = Regex("""6426-ep-\d+""")
+        val episodeSlug = Regex("""\d+-ep-\d+""")
         for (i in 0 until data.length()) {
             val item = data.optJSONObject(i) ?: continue
-            if (item.optInt("series_id", 6426) != 6426) continue
             val slug = item.optString("slug").ifBlank {
                 item.optJSONObject("content")?.optString("slug").orEmpty()
             }
-            if (!episodeSlug.matches(slug)) continue // only use real episode links, never guessed IDs
+            if (!episodeSlug.matches(slug)) continue // use only real episode slugs
+            val seriesId = item.optInt("series_id", 0)
+            if (seriesId > 0 && !slug.startsWith("$seriesId-ep-")) continue
             val number = item.optDouble("sort", Double.NaN)
             if (number.isNaN() || number.isInfinite() || number <= 0) continue
             val title = item.optString("title").trim()
@@ -164,17 +264,17 @@ class ArcBridge : HttpSource() {
     }
 
     /** Inertia places its first JSON page in the HTML's data-page attribute. */
-    private fun readInitialBatch(doc: Document): Pair<EpisodeBatch?, String?> {
+    private fun readInitialBatch(doc: Document, bookPath: String): Pair<EpisodeBatch?, String?> {
         val raw = doc.selectFirst("[data-page]")?.attr("data-page").orEmpty()
         if (raw.isBlank()) return null to null
         return runCatching {
             val payload = JSONObject(raw)
-            parseEpisodeBatch(payload) to payload.optString("version").takeIf { it.isNotBlank() }
+            parseEpisodeBatch(payload, bookPath) to payload.optString("version").takeIf { it.isNotBlank() }
         }.getOrElse { null to null }
     }
 
     /** Accept the JSON page object either from an Inertia response or the full HTML shell. */
-    private fun readEpisodePayload(body: String, url: String, page: Int): EpisodeBatch {
+    private fun readEpisodePayload(body: String, url: String, page: Int, bookPath: String): EpisodeBatch {
         val trimmed = body.trimStart()
         val json = if (trimmed.startsWith("{")) {
             JSONObject(trimmed)
@@ -188,7 +288,7 @@ class ArcBridge : HttpSource() {
                 ?: error("Episode page $page has an unrecognised Inertia page object")
             JSONObject(raw)
         }
-        return parseEpisodeBatch(json).also {
+        return parseEpisodeBatch(json, bookPath).also {
             check(it.page == page) {
                 "Expected episode page $page but the server returned ${it.page}"
             }
@@ -196,7 +296,7 @@ class ArcBridge : HttpSource() {
     }
 
     /** Request ?page=N as a normal page visit: no X-Inertia-Version means no stale-asset 409. */
-    private fun getEpisodeBatchHtml(page: Int): EpisodeBatch {
+    private fun getEpisodeBatchHtml(page: Int, bookPath: String): EpisodeBatch {
         val request = Request.Builder()
             .url("$baseUrl$bookPath?page=$page")
             .header("User-Agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Version/17.0 Mobile/15E148 Safari/604.1")
@@ -208,12 +308,12 @@ class ArcBridge : HttpSource() {
                 "Full HTML episode page $page returned HTTP ${response.code}"
             }
             val body = response.body?.string() ?: error("No body in HTML episode page $page")
-            return readEpisodePayload(body, response.request.url.toString(), page)
+            return readEpisodePayload(body, response.request.url.toString(), page, bookPath)
         }
     }
 
-    private fun getEpisodeBatch(page: Int, inertiaVersion: String?): EpisodeBatch {
-        if (usePlainHtmlForEpisodes) return getEpisodeBatchHtml(page)
+    private fun getEpisodeBatch(page: Int, inertiaVersion: String?, bookPath: String): EpisodeBatch {
+        if (usePlainHtmlForEpisodes) return getEpisodeBatchHtml(page, bookPath)
         val request = Request.Builder()
             .url("$baseUrl$bookPath?page=$page")
             .header("User-Agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Version/17.0 Mobile/15E148 Safari/604.1")
@@ -231,23 +331,24 @@ class ArcBridge : HttpSource() {
                 // Inertia uses 409 + X-Inertia-Location for asset-version mismatch.
                 // Switching to a regular GET loads the current page without stale headers.
                 usePlainHtmlForEpisodes = true
-                return getEpisodeBatchHtml(page)
+                return getEpisodeBatchHtml(page, bookPath)
             }
             check(response.isSuccessful) { "Episode list page $page returned HTTP ${response.code}" }
             val body = response.body?.string() ?: error("No response for episode page $page")
-            return readEpisodePayload(body, response.request.url.toString(), page)
+            return readEpisodePayload(body, response.request.url.toString(), page, bookPath)
         }
     }
 
-    private fun getChaptersBlocking(): List<SChapter> {
+    private fun getChaptersBlocking(manga: SManga): List<SChapter> {
+        val bookPath = novelPath(manga.url)
         val doc = loadHtml(bookPath)
         val results = linkedMapOf<String, EpisodeInfo>()
-        val (initial, inertiaVersion) = readInitialBatch(doc)
+        val (initial, inertiaVersion) = readInitialBatch(doc, bookPath)
         initial?.records?.forEach { results[it.path] = it }
 
         // Keep an HTML fallback, useful when the initial server-rendered payload is absent.
-        val episodeLink = Regex("""^/[^/]+/6426-ep-\d+$""")
-        for (anchor in doc.select("a[href*='6426-ep-']")) {
+        val episodeLink = Regex("""^/[^/]+/\d+-ep-\d+$""")
+        for (anchor in doc.select("a[href*='-ep-']")) {
             val fullUrl = anchor.absUrl("href")
             if (!fullUrl.startsWith("$baseUrl/")) continue
             val path = fullUrl.removePrefix(baseUrl).substringBefore('#').substringBefore('?')
@@ -265,7 +366,7 @@ class ArcBridge : HttpSource() {
         while (page <= minOf(knownLastPage ?: 100, 100)) {
             // A temporary failure must not wipe out already loaded chapters.
             val batch = try {
-                getEpisodeBatch(page, inertiaVersion)
+                getEpisodeBatch(page, inertiaVersion, bookPath)
             } catch (e: Exception) {
                 if (results.isEmpty()) throw e
                 break // Keep the chapters we have rather than reporting an empty source.
@@ -282,8 +383,6 @@ class ArcBridge : HttpSource() {
             page++
         }
 
-        // The first chapter URL came from the user; retain it even if omitted by the site's pagination.
-        results.putIfAbsent(firstPath, EpisodeInfo(firstPath, "1화", 1f))
         return results.values.distinctBy { it.number }.sortedByDescending { it.number }
             .map { ep -> SChapter.create().apply {
                 url = ep.path
@@ -304,7 +403,10 @@ class ArcBridge : HttpSource() {
     }
 
     private fun loadHtml(path: String): Document {
-        require(path == bookPath || Regex("""^/[^/]+/6426-ep-\d+$""").matches(path)) { "Unexpected path" }
+        val valid = path == "/" || Regex("""^/\?page=\d+$""").matches(path) ||
+            Regex("""^/[^/?#\\]+$""").matches(path) ||
+            Regex("""^/[^/?#\\]+/\d+-ep-\d+$""").matches(path)
+        require(valid) { "Unexpected path: $path" }
         val request = Request.Builder()
             .url(baseUrl + path)
             .header("User-Agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Version/17.0 Mobile/15E148 Safari/604.1")
