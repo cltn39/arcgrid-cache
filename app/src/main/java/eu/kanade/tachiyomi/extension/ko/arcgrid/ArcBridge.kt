@@ -182,7 +182,7 @@ class ArcBridge : HttpSource() {
             .header("X-Inertia", "true")
             .header("X-Inertia-Partial-Component", "contents/List")
             .header("X-Inertia-Partial-Data", "episodes")
-            .header("Referer", baseUrl + bookPath)
+            .header("Referer", Request.Builder().url(baseUrl + bookPath).build().url.toString())
             .apply { if (!inertiaVersion.isNullOrBlank()) header("X-Inertia-Version", inertiaVersion) }
             .build()
         client.newCall(request).execute().use { response ->
