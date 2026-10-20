@@ -1,4 +1,3 @@
-
 name: Package
 
 on:
@@ -7,7 +6,11 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: arcgrid-package
+  cancel-in-progress: false
 
 jobs:
   package:
@@ -28,13 +31,173 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
 
+      - name: Prepare persistent signing and version
+        shell: bash
+        env:
+          ARCG_SIGNING_JSON: ${{ secrets.ARCG_SIGNING_JSON }}
+        run: |
+          python3 - <<'PY'
+          import base64, binascii, json, os, re, subprocess
+          from pathlib import Path
+
+          run_number = int(os.environ['GITHUB_RUN_NUMBER'])
+          build_file = Path('app/build.gradle')
+          build_script = build_file.read_text(encoding='utf-8')
+          # Use a monotonically increasing version for every GitHub Actions build.
+          build_script, n1 = re.subn(r'\bversionCode\s+\d+', f'versionCode {run_number}', build_script, count=1)
+          build_script, n2 = re.subn(r'\bversionName\s+[\'\"][^\'\"]+[\'\"]', f"versionName '1.4.{run_number}'", build_script, count=1)
+          if n1 != 1 or n2 != 1:
+              raise SystemExit('Unable to locate app version in app/build.gradle')
+
+          raw = os.environ.get('ARCG_SIGNING_JSON', '').strip()
+          if not raw:
+              print('ARCG_SIGNING_JSON is not configured; building a test APK only, without publishing a repository.')
+              build_file.write_text(build_script, encoding='utf-8')
+              with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as env:
+                  env.write('ARCG_PUBLISH_READY=false\n')
+              with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
+                  summary.write('### Extension repository not published\nSet the ARCG_SIGNING_JSON Actions secret and rerun Package.\n')
+          else:
+              try:
+                  signing = json.loads(raw)
+                  password = signing['password']
+                  data = base64.b64decode(signing['keystore_b64'], validate=True)
+                  if not isinstance(password, str) or len(password) < 8 or not data or '\n' in password:
+                      raise ValueError('Invalid password or keystore')
+              except (ValueError, KeyError, TypeError, binascii.Error) as exc:
+                  raise SystemExit('Invalid ARCG_SIGNING_JSON repository secret') from exc
+
+              keyfile = Path(os.environ['RUNNER_TEMP']) / 'arcgrid-release-signing.jks'
+              keyfile.write_bytes(data)
+              keyfile.chmod(0o600)
+              subprocess.run(
+                  ['keytool', '-list', '-keystore', str(keyfile), '-alias', 'arcgrid', '-storepass', password],
+                  stdout=subprocess.DEVNULL, check=True,
+              )
+              print('::add-mask::' + password)
+              with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as env:
+                  env.write(f'ARCG_SIGNING_FILE={keyfile}\n')
+                  env.write(f'ARCG_SIGNING_PASSWORD={password}\n')
+                  env.write('ARCG_PUBLISH_READY=true\n')
+              # The key is never committed. Patch the checkout only on the runner.
+              marker = 'buildTypes { release { minifyEnabled false; signingConfig signingConfigs.debug } }'
+              replacement = (
+                  'signingConfigs { arcgridRelease { '
+                  "storeFile file(System.getenv('ARCG_SIGNING_FILE')); "
+                  "storePassword System.getenv('ARCG_SIGNING_PASSWORD'); "
+                  "keyAlias 'arcgrid'; keyPassword System.getenv('ARCG_SIGNING_PASSWORD') "
+                  '} }\n    '
+                  'buildTypes { release { minifyEnabled false; signingConfig signingConfigs.arcgridRelease } }'
+              )
+              if build_script.count(marker) != 1:
+                  raise SystemExit('Expected debug signing block not found in app/build.gradle')
+              build_file.write_text(build_script.replace(marker, replacement), encoding='utf-8')
+              print(f'Private release key enabled for build {run_number}.')
+          PY
+
       - name: Build APK
         run: |
           chmod +x gradlew
           ./gradlew --no-daemon :app:assembleRelease
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload APK for manual testing
+        uses: actions/upload-artifact@v4
         with:
           name: px-cache-package
           path: app/build/outputs/apk/release/*.apk
           if-no-files-found: error
+
+      - name: Generate Tachimanga repository files
+        if: env.ARCG_PUBLISH_READY == 'true'
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib, html, json, os, re, shutil, subprocess
+          from pathlib import Path
+
+          root = Path.cwd()
+          metadata = json.loads((root / 'app/build/outputs/apk/release/output-metadata.json').read_text(encoding='utf-8'))
+          pkg = 'eu.kanade.tachiyomi.extension.ko.arcgrid'
+          if metadata['applicationId'] != pkg:
+              raise SystemExit('APK package changed unexpectedly')
+          element = metadata['elements'][0]
+          code = int(element['versionCode'])
+          version = str(element['versionName'])
+          apk = root / 'app/build/outputs/apk/release' / element['outputFile']
+          if not apk.is_file():
+              raise SystemExit('No release APK found')
+
+          source = (root / 'app/src/main/java/eu/kanade/tachiyomi/extension/ko/arcgrid/ArcBridge.kt').read_text(encoding='utf-8')
+          def property_value(name):
+              match = re.search(r'override\s+val\s+' + re.escape(name) + r'\s*=\s*"([^"]+)"', source)
+              if not match:
+                  raise SystemExit('Missing source property ' + name)
+              return match.group(1)
+          name = property_value('name')
+          lang = property_value('lang')
+          url = property_value('baseUrl')
+          match = re.search(r'override\s+val\s+versionId\s*=\s*(\d+)', source)
+          version_id = int(match.group(1)) if match else 1
+          source_hash = hashlib.md5(f'{name.lower()}/{lang}/{version_id}'.encode('utf-8')).hexdigest()
+          source_id = str(int(source_hash[:16], 16) & 0x7FFFFFFFFFFFFFFF)
+
+          cert = subprocess.check_output([
+              'keytool', '-exportcert', '-alias', 'arcgrid',
+              '-keystore', os.environ['ARCG_SIGNING_FILE'],
+              '-storepass', os.environ['ARCG_SIGNING_PASSWORD'],
+          ])
+          fingerprint = hashlib.sha256(cert).hexdigest()
+          filename = f'tachiyomi-{lang}.arcgrid-v{version}.apk'
+          out = root / 'dist'
+          (out / 'apk').mkdir(parents=True, exist_ok=True)
+          shutil.copy2(apk, out / 'apk' / filename)
+          item = {
+              'name': 'Tachiyomi: Page Cache',
+              'pkg': pkg,
+              'apk': filename,
+              'lang': lang,
+              'code': code,
+              'version': version,
+              'nsfw': 1,
+              'sources': [{
+                  'name': name,
+                  'lang': lang,
+                  'id': source_id,
+                  'baseUrl': url,
+                  'versionId': version_id,
+              }],
+          }
+          (out / 'index.min.json').write_text(json.dumps([item], ensure_ascii=False, separators=(',', ':')) + '\n', encoding='utf-8')
+          (out / 'index.json').write_text(json.dumps([item], ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+          (out / 'repo.json').write_text(json.dumps({
+              'meta': {
+                  'name': 'ArcGrid Page Cache',
+                  'shortName': 'ArcGrid',
+                  'website': 'https://github.com/cltn39/arcgrid-cache',
+                  'signingKeyFingerprint': fingerprint,
+              },
+          }, indent=2) + '\n', encoding='utf-8')
+          (out / 'index.html').write_text(
+              '<!doctype html><meta charset="utf-8"><title>ArcGrid Extension</title>'
+              '<h1>ArcGrid Page Cache</h1><p>Use index.min.json in Tachimanga.</p>'
+              f'<a href="apk/{html.escape(filename, quote=True)}">Download {html.escape(filename)}</a>\n',
+              encoding='utf-8',
+          )
+          print(f'Prepared {filename}, source ID {source_id}, certificate SHA-256 {fingerprint}')
+          PY
+
+      - name: Publish extension repository
+        if: env.ARCG_PUBLISH_READY == 'true'
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: repo
+          publish_dir: ./dist
+          force_orphan: true
+          keep_files: false
+
+      - name: Show repository URL
+        if: env.ARCG_PUBLISH_READY == 'true'
+        run: |
+          echo 'Add to Tachimanga → Extension Repositories:' >> "$GITHUB_STEP_SUMMARY"
+          echo "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/repo/index.min.json" >> "$GITHUB_STEP_SUMMARY"
