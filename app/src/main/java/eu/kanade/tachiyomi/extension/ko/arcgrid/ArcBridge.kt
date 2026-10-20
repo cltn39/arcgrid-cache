@@ -7,6 +7,7 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.ResponseBody.Companion.toResponseBody
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
+import org.json.JSONObject
 import rx.Observable
 
 /** Experimental single-title source: Bookkor HTML -> bitmap-font -> PNG without Android graphics. */
@@ -127,42 +128,129 @@ class ArcBridge : HttpSource() {
         return null
     }
 
-    override fun fetchChapterList(manga: SManga): Observable<List<SChapter>> = Observable.fromCallable { getChaptersBlocking() }
+    override fun fetchChapterList(manga: SManga): Observable<List<SChapter>> =
+        Observable.fromCallable { getChaptersBlocking() }
+
     override suspend fun getChapterList(manga: SManga): List<SChapter> = getChaptersBlocking()
-    private fun getChaptersBlocking(): List<SChapter> {
-        val doc = loadHtml(bookPath)
-        val paths = linkedMapOf<String, Pair<String, Float>>()
-        val episodeLink = Regex("""^/[^/]+/6426-ep-\d+$""")
-        for (anchor in doc.select("a[href*='6426-ep-']")) {
-            val url = anchor.absUrl("href")
-            if (!url.startsWith("$baseUrl/")) continue
-            val path = url.removePrefix(baseUrl).substringBefore('#').substringBefore('?')
-            if (!episodeLink.matches(path)) continue
-            val label = anchor.text().trim()
-            val num = Regex("""(\d+)\s*화""").find(label)?.groupValues?.get(1)?.toFloatOrNull()
-                ?: continue
-            paths[path] = label to num
+
+    private data class EpisodeInfo(val path: String, val name: String, val number: Float)
+    private data class EpisodeBatch(val records: List<EpisodeInfo>, val page: Int, val lastPage: Int?)
+
+    private fun parseEpisodeBatch(inertia: JSONObject): EpisodeBatch {
+        val listing = inertia.optJSONObject("props")?.optJSONObject("episodes")
+            ?: error("Inertia response does not contain props.episodes")
+        val data = listing.optJSONArray("data") ?: error("Episode page has no data array")
+        val records = ArrayList<EpisodeInfo>(data.length())
+        val episodeSlug = Regex("""6426-ep-\d+""")
+        for (i in 0 until data.length()) {
+            val item = data.optJSONObject(i) ?: continue
+            if (item.optInt("series_id", 6426) != 6426) continue
+            val slug = item.optString("slug").ifBlank {
+                item.optJSONObject("content")?.optString("slug").orEmpty()
+            }
+            if (!episodeSlug.matches(slug)) continue // only use real episode links, never guessed IDs
+            val number = item.optDouble("sort", Double.NaN)
+            if (number.isNaN() || number.isInfinite() || number <= 0) continue
+            val title = item.optString("title").trim()
+            val label = title.ifBlank { "${number.toInt()}화" }
+            records += EpisodeInfo("$bookPath/$slug", label, number.toFloat())
         }
-        // The user supplied this particular chapter URL, so it is the only hard-coded episode.
-        paths.putIfAbsent(firstPath, "1화 (직접 지정된 링크)" to 1f)
-        // Never assume that episode IDs increase by one. Discover the next chapter via links.
-        if (paths.values.none { it.second == 2f }) {
-            val first = runCatching { loadHtml(firstPath) }.getOrNull()
-            first?.select("a[href*='6426-ep-']")?.forEach { anchor ->
-                val label = anchor.text().trim()
-                val hint = (label + " " + anchor.className() + " " + anchor.attr("rel"))
-                if (!(hint.contains("다음") || hint.contains("next", true) || hint.contains("2화"))) return@forEach
-                val url = anchor.absUrl("href")
-                if (!url.startsWith("$baseUrl/")) return@forEach
-                val path = url.removePrefix(baseUrl).substringBefore('#').substringBefore('?')
-                if (path != firstPath && episodeLink.matches(path)) {
-                    paths.putIfAbsent(path, "2화 (다음 회차 링크에서 발견)" to 2f)
-                }
+        return EpisodeBatch(
+            records,
+            listing.optInt("current_page", 1),
+            listing.optInt("last_page", 0).takeIf { it > 0 },
+        )
+    }
+
+    /** Inertia places its first JSON page in the HTML's data-page attribute. */
+    private fun readInitialBatch(doc: Document): Pair<EpisodeBatch?, String?> {
+        val raw = doc.selectFirst("[data-page]")?.attr("data-page").orEmpty()
+        if (raw.isBlank()) return null to null
+        return runCatching {
+            val payload = JSONObject(raw)
+            parseEpisodeBatch(payload) to payload.optString("version").takeIf { it.isNotBlank() }
+        }.getOrElse { null to null }
+    }
+
+    private fun getEpisodeBatch(page: Int, inertiaVersion: String?): EpisodeBatch {
+        val request = Request.Builder()
+            .url("$baseUrl$bookPath?page=$page")
+            .header("User-Agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Version/17.0 Mobile/15E148 Safari/604.1")
+            .header("Accept-Language", "ko-KR,ko;q=0.9,en;q=0.7")
+            .header("Accept", "text/html, application/xhtml+xml")
+            .header("X-Requested-With", "XMLHttpRequest")
+            .header("X-Inertia", "true")
+            .header("X-Inertia-Partial-Component", "contents/List")
+            .header("X-Inertia-Partial-Data", "episodes")
+            .header("Referer", baseUrl + bookPath)
+            .apply { if (!inertiaVersion.isNullOrBlank()) header("X-Inertia-Version", inertiaVersion) }
+            .build()
+        client.newCall(request).execute().use { response ->
+            check(response.isSuccessful) {
+                "Episode list page $page returned HTTP ${response.code}. " +
+                    "Inertia version or site request rules may have changed."
+            }
+            val body = response.body?.string() ?: error("No response for episode page $page")
+            val payload = if (body.trimStart().startsWith("{")) {
+                JSONObject(body)
+            } else {
+                // Some deployments return the entire HTML page even for an Inertia GET.
+                val doc = Jsoup.parse(body, response.request.url.toString())
+                val embedded = doc.selectFirst("[data-page]")?.attr("data-page")
+                    ?: error("Episode page $page did not contain JSON or Inertia data-page")
+                JSONObject(embedded)
+            }
+            return parseEpisodeBatch(payload).also {
+                check(it.page == page) { "Requested episode page $page, received ${it.page}" }
             }
         }
-        return paths.map { (url, meta) -> SChapter.create().apply {
-            this.url = url; name = meta.first; chapter_number = meta.second
-        } }.distinctBy { it.chapter_number }.sortedByDescending { it.chapter_number }
+    }
+
+    private fun getChaptersBlocking(): List<SChapter> {
+        val doc = loadHtml(bookPath)
+        val results = linkedMapOf<String, EpisodeInfo>()
+        val (initial, inertiaVersion) = readInitialBatch(doc)
+        initial?.records?.forEach { results[it.path] = it }
+
+        // Keep an HTML fallback, useful when the initial server-rendered payload is absent.
+        val episodeLink = Regex("""^/[^/]+/6426-ep-\d+$""")
+        for (anchor in doc.select("a[href*='6426-ep-']")) {
+            val fullUrl = anchor.absUrl("href")
+            if (!fullUrl.startsWith("$baseUrl/")) continue
+            val path = fullUrl.removePrefix(baseUrl).substringBefore('#').substringBefore('?')
+            if (!episodeLink.matches(path) || path in results) continue
+            val title = anchor.text().trim()
+            val number = Regex("""(\d+)\s*화""").find(title)?.groupValues?.get(1)?.toFloatOrNull()
+                ?: continue
+            results[path] = EpisodeInfo(path, title, number)
+        }
+
+        // Follow the site's actual paginated episode feed; do not synthesize slugs.
+        val knownLastPage = initial?.lastPage
+        var page = 2
+        var previousFirstPath: String? = null
+        while (page <= minOf(knownLastPage ?: 100, 100)) {
+            val batch = getEpisodeBatch(page, inertiaVersion)
+            if (batch.records.isEmpty()) break
+            check(batch.records.first().path != previousFirstPath) {
+                "Episode page $page repeated previous page; stopped to prevent an infinite loop"
+            }
+            previousFirstPath = batch.records.first().path
+            val oldSize = results.size
+            batch.records.forEach { results[it.path] = it }
+            check(results.size > oldSize) { "Episode page $page contained no new chapters" }
+            if (page >= (batch.lastPage ?: knownLastPage ?: 100)) break
+            page++
+        }
+
+        // The first chapter URL came from the user; retain it even if omitted by the site's pagination.
+        results.putIfAbsent(firstPath, EpisodeInfo(firstPath, "1화", 1f))
+        return results.values.distinctBy { it.number }.sortedByDescending { it.number }
+            .map { ep -> SChapter.create().apply {
+                url = ep.path
+                name = ep.name
+                chapter_number = ep.number
+            } }
     }
 
     override fun fetchPageList(chapter: SChapter): Observable<List<Page>> = Observable.fromCallable {
