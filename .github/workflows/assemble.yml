@@ -12,6 +12,7 @@ permissions:
 jobs:
   package:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
@@ -20,11 +21,12 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - uses: gradle/actions/setup-gradle@v4
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools platforms;android-34 build-tools;34.0.0'
 
-      - name: Install Android SDK packages
-        run: |
-          sdkmanager --install "platforms;android-34" "build-tools;34.0.0"
+      - uses: gradle/actions/setup-gradle@v4
 
       - name: Build APK
         run: |
@@ -35,3 +37,4 @@ jobs:
         with:
           name: px-cache-package
           path: app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
