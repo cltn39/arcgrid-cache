@@ -21,6 +21,7 @@ class ArcBridge : HttpSource() {
     private val bookTitle = "여헌터를 따먹으면 주인공이 강해짐"
     private val firstPath = "$bookPath/6426-ep-4165710"
     private val pageHost = "pg-cache.invalid"
+    @Volatile private var usePlainHtmlForEpisodes = false
     @Volatile private var cachedCoverUrl: String? = null
 
     // Access this same client from the PNG image loader, just as the successful demo did.
@@ -172,7 +173,47 @@ class ArcBridge : HttpSource() {
         }.getOrElse { null to null }
     }
 
+    /** Accept the JSON page object either from an Inertia response or the full HTML shell. */
+    private fun readEpisodePayload(body: String, url: String, page: Int): EpisodeBatch {
+        val trimmed = body.trimStart()
+        val json = if (trimmed.startsWith("{")) {
+            JSONObject(trimmed)
+        } else {
+            val doc = Jsoup.parse(body, url)
+            val root = doc.selectFirst("[data-page]")
+                ?: error("Episode page $page has no embedded Inertia page object")
+            // Inertia v1/v2: JSON in data-page attribute. v3: JSON in a script body.
+            val raw = root.attr("data-page").takeIf { it.trimStart().startsWith("{") }
+                ?: root.data().takeIf { it.trimStart().startsWith("{") }
+                ?: error("Episode page $page has an unrecognised Inertia page object")
+            JSONObject(raw)
+        }
+        return parseEpisodeBatch(json).also {
+            check(it.page == page) {
+                "Expected episode page $page but the server returned ${it.page}"
+            }
+        }
+    }
+
+    /** Request ?page=N as a normal page visit: no X-Inertia-Version means no stale-asset 409. */
+    private fun getEpisodeBatchHtml(page: Int): EpisodeBatch {
+        val request = Request.Builder()
+            .url("$baseUrl$bookPath?page=$page")
+            .header("User-Agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Version/17.0 Mobile/15E148 Safari/604.1")
+            .header("Accept-Language", "ko-KR,ko;q=0.9,en;q=0.7")
+            .header("Accept", "text/html, application/xhtml+xml")
+            .build()
+        client.newCall(request).execute().use { response ->
+            check(response.isSuccessful) {
+                "Full HTML episode page $page returned HTTP ${response.code}"
+            }
+            val body = response.body?.string() ?: error("No body in HTML episode page $page")
+            return readEpisodePayload(body, response.request.url.toString(), page)
+        }
+    }
+
     private fun getEpisodeBatch(page: Int, inertiaVersion: String?): EpisodeBatch {
+        if (usePlainHtmlForEpisodes) return getEpisodeBatchHtml(page)
         val request = Request.Builder()
             .url("$baseUrl$bookPath?page=$page")
             .header("User-Agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Version/17.0 Mobile/15E148 Safari/604.1")
@@ -186,23 +227,15 @@ class ArcBridge : HttpSource() {
             .apply { if (!inertiaVersion.isNullOrBlank()) header("X-Inertia-Version", inertiaVersion) }
             .build()
         client.newCall(request).execute().use { response ->
-            check(response.isSuccessful) {
-                "Episode list page $page returned HTTP ${response.code}. " +
-                    "Inertia version or site request rules may have changed."
+            if (response.code == 409) {
+                // Inertia uses 409 + X-Inertia-Location for asset-version mismatch.
+                // Switching to a regular GET loads the current page without stale headers.
+                usePlainHtmlForEpisodes = true
+                return getEpisodeBatchHtml(page)
             }
+            check(response.isSuccessful) { "Episode list page $page returned HTTP ${response.code}" }
             val body = response.body?.string() ?: error("No response for episode page $page")
-            val payload = if (body.trimStart().startsWith("{")) {
-                JSONObject(body)
-            } else {
-                // Some deployments return the entire HTML page even for an Inertia GET.
-                val doc = Jsoup.parse(body, response.request.url.toString())
-                val embedded = doc.selectFirst("[data-page]")?.attr("data-page")
-                    ?: error("Episode page $page did not contain JSON or Inertia data-page")
-                JSONObject(embedded)
-            }
-            return parseEpisodeBatch(payload).also {
-                check(it.page == page) { "Requested episode page $page, received ${it.page}" }
-            }
+            return readEpisodePayload(body, response.request.url.toString(), page)
         }
     }
 
@@ -230,7 +263,13 @@ class ArcBridge : HttpSource() {
         var page = 2
         var previousFirstPath: String? = null
         while (page <= minOf(knownLastPage ?: 100, 100)) {
-            val batch = getEpisodeBatch(page, inertiaVersion)
+            // A temporary failure must not wipe out already loaded chapters.
+            val batch = try {
+                getEpisodeBatch(page, inertiaVersion)
+            } catch (e: Exception) {
+                if (results.isEmpty()) throw e
+                break // Keep the chapters we have rather than reporting an empty source.
+            }
             if (batch.records.isEmpty()) break
             check(batch.records.first().path != previousFirstPath) {
                 "Episode page $page repeated previous page; stopped to prevent an infinite loop"
