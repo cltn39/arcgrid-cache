@@ -6,8 +6,8 @@ android {
         applicationId 'eu.kanade.tachiyomi.extension.ko.arcgrid'
         minSdk 21
         targetSdk 28
-        versionCode 3
-        versionName '1.4.3'
+        versionCode 4
+        versionName '1.4.4'
     }
     buildTypes { release { minifyEnabled false; signingConfig signingConfigs.debug } }
     compileOptions { sourceCompatibility JavaVersion.VERSION_1_8; targetCompatibility JavaVersion.VERSION_1_8 }
