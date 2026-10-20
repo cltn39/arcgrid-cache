@@ -18,6 +18,23 @@ class ArcBridge : HttpSource() {
     override val supportsLatest = false
 
     private val pageHost = "pg-cache.invalid"
+
+    /** Known working Bookkor catalogue sections; doesn't change source ID. */
+    private class SectionFilter : Filter.Select<String>(
+        "작품 분류",
+        arrayOf("전체 작품", "일반소설", "성인소설", "BL/GL", "완결소설"),
+    )
+
+    private fun selectedSection(filters: FilterList): String {
+        val index = filters.filterIsInstance<SectionFilter>().firstOrNull()?.state ?: 0
+        return when (index) {
+            1 -> "/일반소설"
+            2 -> "/성인소설"
+            3 -> "/BLGL"
+            4 -> "/완결소설"
+            else -> "/"
+        }
+    }
     @Volatile private var usePlainHtmlForEpisodes = false
     private val coverCache = linkedMapOf<String, String>()
 
@@ -45,7 +62,7 @@ class ArcBridge : HttpSource() {
         val path = value.substringBefore('#').substringBefore('?')
         require(Regex("""^/[^/?#\\]+$""").matches(path)) { "Unexpected novel path: $value" }
         require(path != "/" && path != "/검색" && path != "/성인소설" &&
-            path != "/일반소설" && path != "/완결소설") { "Not a novel: $path" }
+            path != "/일반소설" && path != "/완결소설" && path != "/BLGL") { "Not a novel: $path" }
         return path
     }
 
@@ -54,16 +71,17 @@ class ArcBridge : HttpSource() {
         return java.net.URLDecoder.decode(raw.replace("+", "%2B"), "UTF-8").replace('-', ' ')
     }
 
-    private fun categoryPage(page: Int, query: String): Pair<JSONObject, Document?> {
+    private fun categoryPage(page: Int, query: String, section: String): Pair<JSONObject, Document?> {
         require(page in 1..200) { "Invalid catalogue page: $page" }
         val keyword = query.trim()
-        // This is the confirmed site search endpoint: /?keyword=<UTF-8 query>.
+        // Site-wide search uses /?keyword=...; known section pages support catalogue browsing.
+        // When a keyword is supplied with a section, pass it to that section URL.
         val queryString = if (keyword.isBlank()) "?page=$page" else {
             val encoded = java.net.URLEncoder.encode(keyword, "UTF-8").replace("+", "%20")
             "?keyword=$encoded&page=$page"
         }
         val request = Request.Builder()
-            .url("$baseUrl/$queryString")
+            .url("$baseUrl$section$queryString")
             .header("User-Agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Version/17.0 Mobile/15E148 Safari/604.1")
             .header("Accept-Language", "ko-KR,ko;q=0.9,en;q=0.7")
             // Ordinary HTML GET avoids the 409 experienced with stale Inertia headers.
@@ -83,8 +101,8 @@ class ArcBridge : HttpSource() {
         }
     }
 
-    private fun cataloguePage(page: Int, query: String): MangasPage {
-        val (payload, htmlDoc) = categoryPage(page, query)
+    private fun cataloguePage(page: Int, query: String, section: String = "/"): MangasPage {
+        val (payload, htmlDoc) = categoryPage(page, query, section)
         // Captured search response uses component=contents/Home and props.comics.data.
         val props = payload.optJSONObject("props")
             ?: error("Bookkor catalogue response has no props")
@@ -158,7 +176,7 @@ class ArcBridge : HttpSource() {
     }
 
     override fun fetchSearchManga(page: Int, query: String, filters: FilterList): Observable<MangasPage> =
-        Observable.fromCallable { cataloguePage(page, query) }
+        Observable.fromCallable { cataloguePage(page, query, selectedSection(filters)) }
 
     override fun fetchLatestUpdates(page: Int): Observable<MangasPage> = fetchPopularManga(page)
 
@@ -420,7 +438,7 @@ class ArcBridge : HttpSource() {
         }
     }
 
-    override fun getFilterList() = FilterList()
+    override fun getFilterList() = FilterList(SectionFilter())
     override fun imageUrlParse(response: Response): String = error("Image URLs are provided directly")
     override fun popularMangaRequest(page: Int): Request = error("Custom observable source")
     override fun popularMangaParse(response: Response): MangasPage = error("Custom observable source")
