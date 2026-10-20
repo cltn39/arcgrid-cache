@@ -139,7 +139,8 @@ jobs:
           match = re.search(r'override\s+val\s+versionId\s*=\s*(\d+)', source)
           version_id = int(match.group(1)) if match else 1
           source_hash = hashlib.md5(f'{name.lower()}/{lang}/{version_id}'.encode('utf-8')).hexdigest()
-          source_id = str(int(source_hash[:16], 16) & 0x7FFFFFFFFFFFFFFF)
+          explicit_id = re.search(r'override\s+val\s+id\s*:\s*Long\s*=\s*(\d+)L', source)
+          source_id = explicit_id.group(1) if explicit_id else str(int(source_hash[:16], 16) & 0x7FFFFFFFFFFFFFFF)
 
           cert = subprocess.check_output([
               'keytool', '-exportcert', '-alias', 'arcgrid',
@@ -152,7 +153,7 @@ jobs:
           (out / 'apk').mkdir(parents=True, exist_ok=True)
           shutil.copy2(apk, out / 'apk' / filename)
           item = {
-              'name': 'Tachiyomi: Page Cache',
+              'name': 'Tachiyomi: Bookkor',
               'pkg': pkg,
               'apk': filename,
               'lang': lang,
@@ -171,15 +172,15 @@ jobs:
           (out / 'index.json').write_text(json.dumps([item], ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
           (out / 'repo.json').write_text(json.dumps({
               'meta': {
-                  'name': 'ArcGrid Page Cache',
+                  'name': 'Bookkor',
                   'shortName': 'ArcGrid',
                   'website': 'https://github.com/cltn39/arcgrid-cache',
                   'signingKeyFingerprint': fingerprint,
               },
           }, indent=2) + '\n', encoding='utf-8')
           (out / 'index.html').write_text(
-              '<!doctype html><meta charset="utf-8"><title>ArcGrid Extension</title>'
-              '<h1>ArcGrid Page Cache</h1><p>Use index.min.json in Tachimanga.</p>'
+              '<!doctype html><meta charset="utf-8"><title>Bookkor Extension</title>'
+              '<h1>Bookkor</h1><p>Use index.min.json in Tachimanga.</p>'
               f'<a href="apk/{html.escape(filename, quote=True)}">Download {html.escape(filename)}</a>\n',
               encoding='utf-8',
           )
