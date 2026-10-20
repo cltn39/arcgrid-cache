@@ -1,39 +1,56 @@
 package eu.kanade.tachiyomi.extension.ko.arcgrid
 
-/** Convert Korean text into continuous page images, with paragraph breaks. */
+/** Lay out a Korean chapter on pages with phone-readable text. */
 internal object FlowPages {
+    private const val COLUMNS = PortablePng.MAX_COLUMNS
+    private const val ROWS = PortablePng.MAX_ROWS
+
     fun render(text: String, heading: String): List<ByteArray> {
         val lines = arrayListOf<String>()
-        lines += heading.take(28)
+        lines += heading.take(COLUMNS)
         lines += ""
         for (paragraph in text.replace("\r\n", "\n").replace('\r', '\n').split('\n')) {
             if (paragraph.isBlank()) {
                 if (lines.lastOrNull() != "") lines += ""
                 continue
             }
-            val trimmed = paragraph.trim()
-            var row = StringBuilder()
-            for (word in trimmed.split(' ')) {
-                if (word.isEmpty()) continue
-                if (row.isNotEmpty() && row.length + 1 + word.length > 28) {
-                    lines += row.toString(); row = StringBuilder()
-                }
-                var remain = word
-                while (remain.length > 28) {
-                    if (row.isNotEmpty()) { lines += row.toString(); row = StringBuilder() }
-                    lines += remain.take(28)
-                    remain = remain.drop(28)
-                }
-                if (remain.isNotEmpty()) {
-                    if (row.isNotEmpty()) row.append(' ')
-                    row.append(remain)
+            val words = paragraph.trim().split(Regex("[\\t ]+"))
+            val row = StringBuilder()
+            fun flush() {
+                if (row.isNotEmpty()) {
+                    lines += row.toString()
+                    row.setLength(0)
                 }
             }
-            if (row.isNotEmpty()) lines += row.toString()
-            lines += ""
+            for (word in words) {
+                if (word.isBlank()) continue
+                var remaining = word
+                while (remaining.isNotEmpty()) {
+                    if (row.isNotEmpty()) {
+                        if (row.length + 1 + remaining.length <= COLUMNS) {
+                            row.append(' ').append(remaining)
+                            remaining = ""
+                        } else {
+                            flush()
+                        }
+                        continue
+                    }
+                    if (remaining.length <= COLUMNS) {
+                        row.append(remaining)
+                        remaining = ""
+                    } else {
+                        // Long unspaced runs (e.g. URLs or unusual punctuation) should not overflow.
+                        lines += remaining.take(COLUMNS)
+                        remaining = remaining.drop(COLUMNS)
+                    }
+                }
+            }
+            flush()
+            if (lines.lastOrNull() != "") lines += ""
         }
-        if (lines.isEmpty()) error("No content")
-        val chunks = lines.chunked(27)
+        while (lines.lastOrNull() == "") lines.removeAt(lines.lastIndex)
+        require(lines.isNotEmpty()) { "No chapter content" }
+        val chunks = lines.chunked(ROWS)
         check(chunks.size <= 200) { "Unexpectedly large chapter" }
         return chunks.map { PortablePng.render(it) }
     }
