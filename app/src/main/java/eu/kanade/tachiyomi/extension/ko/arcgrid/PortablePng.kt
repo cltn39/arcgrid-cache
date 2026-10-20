@@ -4,7 +4,7 @@ import java.io.ByteArrayOutputStream
 import kotlin.math.floor
 
 /**
- * Portable anti-aliased Korean text renderer.
+ * E-book style, phone-readable Korean text renderer (18 columns, 19 rows).
  * The iOS extension runtime may not support android.graphics or java.awt, so the original
  * Nanum bitmap glyphs are resampled to larger glyphs, encoded as 4-bit grayscale PNGs.
  * No Android graphics, AWT, or java.util.zip dependency is introduced.
@@ -12,14 +12,15 @@ import kotlin.math.floor
 internal object PortablePng {
     const val WIDTH = 744
     const val HEIGHT = 1144
-    const val MAX_COLUMNS = 20
-    const val MAX_ROWS = 22
-    private const val FONT_WIDTH = 36
-    private const val FONT_HEIGHT = 42
-    private const val LETTER_ADVANCE = 35
-    private const val LINE_ADVANCE = 48
+    const val MAX_COLUMNS = 18
+    const val MAX_ROWS = 19
+    private const val FONT_WIDTH = 34
+    private const val FONT_HEIGHT = 40
+    private const val LETTER_ADVANCE = 36
+    private const val LINE_ADVANCE = 56
     private const val START_X = (WIDTH - ((MAX_COLUMNS - 1) * LETTER_ADVANCE + FONT_WIDTH)) / 2
-    private const val START_Y = 52
+    private const val START_Y = 48
+    // At 390pt-wide phone display: about 18pt glyphs, 25pt margins and 29pt line pitch.
     private const val PITCH = WIDTH / 2 // 4-bit grayscale: two pixels per byte
 
     private val crcTable = IntArray(256) { value ->
