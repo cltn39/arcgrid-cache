@@ -20,6 +20,7 @@ class ArcBridge : HttpSource() {
     private val bookTitle = "여헌터를 따먹으면 주인공이 강해짐"
     private val firstPath = "$bookPath/6426-ep-4165710"
     private val pageHost = "pg-cache.invalid"
+    @Volatile private var cachedCoverUrl: String? = null
 
     // Access this same client from the PNG image loader, just as the successful demo did.
     override val client: OkHttpClient = network.client.newBuilder()
@@ -45,14 +46,27 @@ class ArcBridge : HttpSource() {
         title = bookTitle
         description = "실험: 사이트에서 회차를 읽고 글자를 직접 PNG로 변환합니다. 예제 작품 한 개만 포함합니다."
         genre = "텍스트, 실험"
-        initialized = true
+        // Existing library entries may need a metadata refresh to receive a cover URL.
+        initialized = false
     }
 
-    override fun fetchPopularManga(page: Int): Observable<MangasPage> =
-        Observable.just(MangasPage(if (page == 1) listOf(oneBook()) else emptyList(), false))
+    // Include cover metadata in the catalogue entry, not only the details callback.
+    private fun listBook(): SManga = oneBook().apply {
+        thumbnail_url = cachedCoverUrl ?: runCatching { coverFrom(loadHtml(bookPath)) }.getOrNull()
+            ?.also { cachedCoverUrl = it }
+    }
+
+    override fun fetchPopularManga(page: Int): Observable<MangasPage> = Observable.fromCallable {
+        MangasPage(if (page == 1) listOf(listBook()) else emptyList(), false)
+    }
 
     override fun fetchSearchManga(page: Int, query: String, filters: FilterList): Observable<MangasPage> =
-        Observable.just(MangasPage(if (page == 1 && bookTitle.contains(query.trim(), true)) listOf(oneBook()) else emptyList(), false))
+        Observable.fromCallable {
+            MangasPage(
+                if (page == 1 && bookTitle.contains(query.trim(), ignoreCase = true)) listOf(listBook()) else emptyList(),
+                false,
+            )
+        }
 
     override fun fetchLatestUpdates(page: Int): Observable<MangasPage> = fetchPopularManga(page)
     override fun fetchMangaDetails(manga: SManga): Observable<SManga> = Observable.fromCallable {
@@ -63,8 +77,54 @@ class ArcBridge : HttpSource() {
         val doc = loadHtml(bookPath)
         return oneBook().apply {
             description = doc.select("meta[name=description]").attr("content").ifBlank { doc.select("h1").firstOrNull()?.text() ?: bookTitle }
-            thumbnail_url = doc.select("meta[property=og:image]").attr("content").ifBlank { null }
+            thumbnail_url = coverFrom(doc).also { if (it != null) cachedCoverUrl = it }
+            initialized = true
         }
+    }
+
+    /** Resolve Open Graph metadata and common lazy-loaded cover image attributes. */
+    private fun coverFrom(doc: Document): String? {
+        fun valid(url: String): Boolean {
+            val lower = url.lowercase()
+            return (lower.startsWith("https://") || lower.startsWith("http://")) &&
+                !listOf("placeholder", "loading.gif", "default-cover", "no-image", "noimage", "logo.", "favicon").any {
+                    it in lower
+                }
+        }
+
+        for (meta in doc.select(
+            "meta[property=og:image],meta[property=og:image:secure_url]," +
+                "meta[name=twitter:image],meta[property=twitter:image],link[rel=image_src]"
+        )) {
+            for (attribute in listOf("content", "href")) {
+                val url = meta.absUrl(attribute)
+                if (valid(url)) return url
+            }
+        }
+
+        val selectors = listOf(
+            ".book-cover img", ".novel-cover img", ".bookimg img",
+            ".book-img img", ".cover img", ".thumbnail img",
+            ".detail-cover img", ".post-thumbnail img",
+            "img[class*=cover]", "img[id*=cover]",
+            "main article img", "article img"
+        )
+        for (selector in selectors) {
+            for (img in doc.select(selector)) {
+                for (attribute in listOf("data-original", "data-src", "data-lazy-src", "data-url", "src")) {
+                    val url = img.absUrl(attribute)
+                    if (valid(url)) return url
+                }
+                for (attribute in listOf("data-srcset", "srcset")) {
+                    val first = img.attr(attribute).substringBefore(',').trim().substringBefore(' ').trim()
+                    if (first.isNotEmpty()) {
+                        val url = runCatching { java.net.URI(doc.baseUri()).resolve(first).toString() }.getOrNull()
+                        if (url != null && valid(url)) return url
+                    }
+                }
+            }
+        }
+        return null
     }
 
     override fun fetchChapterList(manga: SManga): Observable<List<SChapter>> = Observable.fromCallable { getChaptersBlocking() }
@@ -127,7 +187,7 @@ class ArcBridge : HttpSource() {
             check(resp.isSuccessful) { "Site returned HTTP ${resp.code}" }
             val html = resp.body?.string() ?: error("Empty HTML")
             check(html.length > 300) { "Site returned an unexpectedly short page" }
-            return Jsoup.parse(html, baseUrl)
+            return Jsoup.parse(html, resp.request.url.toString())
         }
     }
 
